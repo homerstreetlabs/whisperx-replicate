@@ -1,16 +1,16 @@
-from cog import BasePredictor, Input, Path, BaseModel
-from typing import Any
-from whisperx.audio import N_SAMPLES, log_mel_spectrogram
-
 import gc
 import math
 import os
 import shutil
-import whisperx
 import tempfile
 import time
-import torch
+from typing import Any
+
 import ffmpeg
+import torch
+import whisperx
+from cog import BaseModel, BasePredictor, Input, Path
+from whisperx.audio import N_SAMPLES, log_mel_spectrogram
 
 compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accuracy)
 device = "cuda"
