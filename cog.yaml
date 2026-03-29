@@ -3,6 +3,8 @@ build:
   gpu: true
   system_packages:
     - "ffmpeg"
+    - "libavcodec-extra"
+    - "libswresample-dev"
   python_version: "3.11"
   python_requirements: requirements.txt
 environment:

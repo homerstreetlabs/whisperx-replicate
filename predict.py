@@ -10,11 +10,13 @@ import ffmpeg
 import torch
 import whisperx
 from cog import BaseModel, BasePredictor, Input, Path
+from whisperx.alignment import DEFAULT_ALIGN_MODELS_HF, DEFAULT_ALIGN_MODELS_TORCH
 from whisperx.audio import N_SAMPLES, log_mel_spectrogram
+from whisperx.diarize import DiarizationPipeline
 
 compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accuracy)
 device = "cuda"
-whisper_arch = "./models/faster-whisper-large-v3"
+whisper_arch = "Systran/faster-whisper-large-v3"
 
 
 class Output(BaseModel):
@@ -164,7 +166,7 @@ class Predictor(BasePredictor):
             del model
 
             if align_output:
-                if detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_TORCH or detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_HF:
+                if detected_language in DEFAULT_ALIGN_MODELS_TORCH or detected_language in DEFAULT_ALIGN_MODELS_HF:
                     result = align(audio, result, debug)
                 else:
                     print(f"Cannot align output as language {detected_language} is not supported for alignment")
@@ -294,7 +296,7 @@ def align(audio, result, debug):
 def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
     start_time = time.time_ns() / 1e6
 
-    diarize_model = whisperx.DiarizationPipeline(use_auth_token=huggingface_access_token, device=device)
+    diarize_model = DiarizationPipeline(token=huggingface_access_token, device=device)
     diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
 
     result = whisperx.assign_word_speakers(diarize_segments, result)
