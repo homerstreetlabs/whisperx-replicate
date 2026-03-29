@@ -87,7 +87,13 @@ class Predictor(BasePredictor):
                 default=None),
             debug: bool = Input(
                 description="Print out compute/inference times and memory usage information",
-                default=False)
+                default=False),
+            episode_id: Optional[int] = Input(
+                description="Episode ID for webhook correlation",
+                default=None),
+            user_id: Optional[int] = Input(
+                description="User ID for webhook correlation",
+                default=None),
     ) -> Output:
         with torch.inference_mode():
             asr_options = {
