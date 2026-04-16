@@ -1,7 +1,6 @@
 import gc
 import math
 import os
-import shutil
 import tempfile
 import time
 from typing import Any, Optional
@@ -10,7 +9,8 @@ import ffmpeg
 import torch
 import whisperx
 from cog import BaseModel, BasePredictor, Input, Path
-from whisperx.alignment import DEFAULT_ALIGN_MODELS_HF, DEFAULT_ALIGN_MODELS_TORCH
+from whisperx.alignment import (DEFAULT_ALIGN_MODELS_HF,
+                                DEFAULT_ALIGN_MODELS_TORCH)
 from whisperx.audio import N_SAMPLES, log_mel_spectrogram
 from whisperx.diarize import DiarizationPipeline
 
@@ -26,18 +26,37 @@ class Output(BaseModel):
 
 class Predictor(BasePredictor):
     def setup(self):
-        source_folder = './models/vad'
-        destination_folder = '../root/.cache/torch'
-        file_name = 'whisperx-vad-segmentation.bin'
+        # Pre-download and cache all models during setup to prevent
+        # large downloads during prediction time, which can cause
+        # worker crashes due to timeouts or memory pressure.
 
-        os.makedirs(destination_folder, exist_ok=True)
+        # 1. Pre-cache the whisper ASR model (~3GB from HuggingFace)
+        print("Pre-caching whisper ASR model...")
+        model = whisperx.load_model(whisper_arch, device, compute_type=compute_type)
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        source_file_path = os.path.join(source_folder, file_name)
-        if os.path.exists(source_file_path):
-            destination_file_path = os.path.join(destination_folder, file_name)
+        # 2. Pre-cache the wav2vec2 alignment model (~360MB from PyTorch hub)
+        print("Pre-caching alignment model...")
+        model_a, metadata = whisperx.load_align_model(
+            language_code="en", device="cpu"
+        )
+        del model_a, metadata
+        gc.collect()
 
-            if not os.path.exists(destination_file_path):
-                shutil.copy(source_file_path, destination_folder)
+        # 3. Pre-cache the diarization model if HF token is available
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            print("Pre-caching diarization model...")
+            try:
+                diarize_model = DiarizationPipeline(
+                    token=hf_token, device="cpu"
+                )
+                del diarize_model
+                gc.collect()
+            except Exception as e:
+                print(f"Warning: Could not pre-cache diarization model: {e}")
 
     def predict(
             self,
