@@ -5,3 +5,7 @@ whisperx.egg-info/
 venv
 hg_access_token.txt
 .cog
+
+# Model weights — multi-GB, downloaded by ./build.sh and baked into the image at `cog push`.
+# Reproducible build artifacts, not source; model.bin alone exceeds GitHub's 100MB file limit.
+models/

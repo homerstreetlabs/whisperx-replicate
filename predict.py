@@ -1,22 +1,209 @@
+from cog import BasePredictor, Input, Path, BaseModel
+from typing import Any, Optional
+from whisperx.audio import N_SAMPLES, log_mel_spectrogram
+from whisperx.alignment import DEFAULT_ALIGN_MODELS_TORCH, DEFAULT_ALIGN_MODELS_HF
+from whisperx.diarize import DiarizationPipeline
+
+import atexit
+import faulthandler
 import gc
 import math
 import os
-import tempfile
-import time
-from typing import Any, Optional
-
-import ffmpeg
-import torch
+import shutil
+import signal
+import sys
 import whisperx
-from cog import BaseModel, BasePredictor, Input, Path
-from whisperx.alignment import (DEFAULT_ALIGN_MODELS_HF,
-                                DEFAULT_ALIGN_MODELS_TORCH)
-from whisperx.audio import N_SAMPLES, log_mel_spectrogram
-from whisperx.diarize import DiarizationPipeline
+import tempfile
+import threading
+import time
+import torch
+import traceback
+import ffmpeg
+import logging
+
+os.environ.setdefault(
+    "COG_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accuracy)
 device = "cuda"
-whisper_arch = "Systran/faster-whisper-large-v3"
+whisper_arch = "./models/faster-whisper-large-v3"
+
+logging.basicConfig(level=logging.INFO)
+
+
+# --- Temporary memory tracing (diagnosing intermittent diarization-stage worker kills) ---
+# An OOM kill (SIGKILL) and a native segfault both die with NO Python traceback, so the
+# only way to tell them apart is to sample memory live. The last "[mem] sample" line before
+# the worker dies tells us: (a) which sub-step killed it, and (b) whether host RAM / cgroup
+# memory was at its limit (OOM) or had plenty of headroom (native crash).
+
+def _read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _proc_kb(path, key):
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(key):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def memory_snapshot():
+    g = 1024 ** 3
+    parts = []
+    try:
+        if torch.cuda.is_available():
+            parts.append(f"gpu_alloc={torch.cuda.memory_allocated() / g:.2f}G")
+            parts.append(f"gpu_reserved={torch.cuda.memory_reserved() / g:.2f}G")
+            parts.append(f"gpu_peak={torch.cuda.max_memory_reserved() / g:.2f}G")
+    except Exception:
+        pass
+
+    rss = _proc_kb("/proc/self/status", "VmRSS:")
+    if rss is not None:
+        parts.append(f"rss={rss / g:.2f}G")
+
+    # cgroup v2, then v1 fallback — this is the number the OOM killer actually watches.
+    cur = _read_int("/sys/fs/cgroup/memory.current")
+    mx = _read_int("/sys/fs/cgroup/memory.max")
+    if cur is None:
+        cur = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        mx = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if cur is not None:
+        if mx is not None and mx < (1 << 62):
+            parts.append(f"cgroup={cur / g:.2f}/{mx / g:.2f}G")
+        else:
+            parts.append(f"cgroup={cur / g:.2f}G")
+
+    avail = _proc_kb("/proc/meminfo", "MemAvailable:")
+    if avail is not None:
+        parts.append(f"sys_avail={avail / g:.2f}G")
+
+    return "  ".join(parts) if parts else "n/a"
+
+
+def log_memory(tag):
+    try:
+        logging.info(f"[mem] {tag}: {memory_snapshot()}")
+    except Exception:
+        pass
+
+
+class MemorySampler(threading.Thread):
+    def __init__(self, interval=5.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            log_memory("sample")
+
+    def stop(self):
+        self._stop.set()
+
+
+class memory_tracer:
+    def __init__(self, interval=5.0):
+        self._sampler = MemorySampler(interval)
+
+    def __enter__(self):
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        log_memory("trace start")
+        self._sampler.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._sampler.stop()
+        log_memory("trace end")
+        return False
+# --- end temporary memory tracing ---
+
+
+# --- Temporary crash diagnostics (catch NON-OOM worker deaths) ---
+# An OOM kill arrives as SIGKILL, which is uncatchable — the memory sampler above is how we
+# catch that case. EVERY OTHER death mode is catchable and handled here:
+#   * native segfault in pyannote/torch (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) -> faulthandler
+#   * orchestrator termination / timeout (SIGTERM/SIGINT)                       -> signal logger
+#   * uncaught exception inside the sampler thread                              -> threading hook
+# If the worker dies and NONE of these fire, that itself confirms a hard SIGKILL (OOM).
+
+# Turns a silent native crash into a full all-threads Python traceback on stderr.
+faulthandler.enable(all_threads=True)
+
+
+def _thread_excepthook(args):
+    logging.error(
+        "[crash] unhandled exception in thread %s",
+        getattr(args.thread, "name", "?"),
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+    log_memory("at thread exception")
+
+
+threading.excepthook = _thread_excepthook
+
+
+@atexit.register
+def _log_clean_exit():
+    # Runs only on an orderly interpreter shutdown. If the worker is hard-killed (SIGKILL from
+    # the OOM killer, or a segfault), this line will be ABSENT — its absence is diagnostic.
+    logging.info("[crash] process exiting via atexit (orderly shutdown, not a hard kill)")
+
+
+_TERMINATION_LOGGING_INSTALLED = False
+
+
+def install_termination_logging():
+    # Best-effort logging of catchable termination signals. Chains to whatever handler is
+    # already installed (e.g. cog's) so we observe without changing shutdown behavior. Called
+    # from setup() so it runs after cog has wired up its own handlers. signal.signal() only
+    # works on the main thread, so failures are swallowed.
+    global _TERMINATION_LOGGING_INSTALLED
+    if _TERMINATION_LOGGING_INSTALLED:
+        return
+    _TERMINATION_LOGGING_INSTALLED = True
+
+    def _make_handler(signame, prev):
+        def _handler(signum, frame):
+            logging.error("[crash] received %s (%s) — worker is being terminated", signame, signum)
+            log_memory(f"at {signame}")
+            try:
+                traceback.print_stack(frame)
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                prev(signum, frame)
+            else:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        return _handler
+
+    for signame in ("SIGTERM", "SIGINT"):
+        signum = getattr(signal, signame, None)
+        if signum is None:
+            continue
+        try:
+            prev = signal.getsignal(signum)
+            signal.signal(signum, _make_handler(signame, prev))
+        except Exception as e:
+            logging.warning("[crash] could not install %s handler: %s", signame, e)
+# --- end temporary crash diagnostics ---
 
 
 class Output(BaseModel):
@@ -26,39 +213,22 @@ class Output(BaseModel):
 
 class Predictor(BasePredictor):
     def setup(self):
-        # Pre-download and cache all models during setup to prevent
-        # large downloads during prediction time, which can cause
-        # worker crashes due to timeouts or memory pressure.
+        install_termination_logging()
 
-        # 1. Pre-cache the whisper ASR model (~3GB from HuggingFace)
-        print("Pre-caching whisper ASR model...")
-        model = whisperx.load_model(whisper_arch, device, compute_type=compute_type)
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
+        source_folder = './models/vad'
+        destination_folder = '../root/.cache/torch'
+        file_name = 'whisperx-vad-segmentation.bin'
 
-        # 2. Pre-cache the wav2vec2 alignment model (~360MB from PyTorch hub)
-        print("Pre-caching alignment model...")
-        model_a, metadata = whisperx.load_align_model(
-            language_code="en", device="cpu"
-        )
-        del model_a, metadata
-        gc.collect()
+        os.makedirs(destination_folder, exist_ok=True)
 
-        # 3. Pre-cache the diarization model if HF token is available
-        hf_token = os.environ.get("HF_TOKEN")
-        if hf_token:
-            print("Pre-caching diarization model...")
-            try:
-                diarize_model = DiarizationPipeline(
-                    token=hf_token, device="cpu"
-                )
-                del diarize_model
-                gc.collect()
-            except Exception as e:
-                print(f"Warning: Could not pre-cache diarization model: {e}")
+        source_file_path = os.path.join(source_folder, file_name)
+        if os.path.exists(source_file_path):
+            destination_file_path = os.path.join(destination_folder, file_name)
 
-    def predict(
+            if not os.path.exists(destination_file_path):
+                shutil.copy(source_file_path, destination_folder)
+
+    def run(
             self,
             audio_file: Path = Input(description="Audio file"),
             language: Optional[str] = Input(
@@ -75,6 +245,10 @@ class Predictor(BasePredictor):
                             "retries is reached, the most probable language is kept.",
                 default=5
             ),
+            task: str = Input(
+                description="Task to perform on the audio file. Options are: transcribe, translate (English only)",
+                choices=["transcribe", "translate"],
+                default="transcribe"),
             initial_prompt: Optional[str] = Input(
                 description="Optional text to provide as a prompt for the first window",
                 default=None),
@@ -106,9 +280,13 @@ class Predictor(BasePredictor):
             max_speakers: Optional[int] = Input(
                 description="Maximum number of speakers if diarization is activated (leave blank if unknown)",
                 default=None),
+            user_agent: Optional[str] = Input(
+                description="Override the User-Agent used to download the audio file. Useful when the host "
+                            "blocks the default value.",
+                default=None),
             debug: bool = Input(
                 description="Print out compute/inference times and memory usage information",
-                default=False),
+                default=True),  # TEMP: default-on to capture per-stage timings while diagnosing diarization crashes
             episode_id: Optional[int] = Input(
                 description="Episode ID for webhook correlation",
                 default=None),
@@ -116,7 +294,13 @@ class Predictor(BasePredictor):
                 description="User ID for webhook correlation",
                 default=None),
     ) -> Output:
-        with torch.inference_mode():
+        if diarization and not huggingface_access_token:
+            raise ValueError("huggingface_access_token is required when diarization is enabled")
+
+        if user_agent:
+            os.environ["COG_USER_AGENT"] = user_agent
+
+        with memory_tracer(), torch.inference_mode():
             asr_options = {
                 "temperatures": [temperature],
                 "initial_prompt": initial_prompt
@@ -140,16 +324,16 @@ class Predictor(BasePredictor):
                 segments_starts = distribute_segments_equally(audio_duration, segments_duration_ms,
                                                               language_detection_max_tries)
 
-                print("Detecting languages on segments starting at " + ', '.join(map(str, segments_starts)))
+                logging.info("Detecting languages on segments starting at " + ', '.join(map(str, segments_starts)))
 
                 detected_language_details = detect_language(audio_file, segments_starts, language_detection_min_prob,
-                                                            language_detection_max_tries, asr_options, vad_options)
+                                                            language_detection_max_tries, asr_options, vad_options, task)
 
                 detected_language_code = detected_language_details["language"]
                 detected_language_prob = detected_language_details["probability"]
                 detected_language_iterations = detected_language_details["iterations"]
 
-                print(f"Detected language {detected_language_code} ({detected_language_prob:.2f}) after "
+                logging.info(f"Detected language {detected_language_code} ({detected_language_prob:.2f}) after "
                       f"{detected_language_iterations} iterations.")
 
                 language = detected_language_details["language"]
@@ -157,11 +341,11 @@ class Predictor(BasePredictor):
             start_time = time.time_ns() / 1e6
 
             model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, language=language,
-                                        asr_options=asr_options, vad_options=vad_options)
+                                        asr_options=asr_options, vad_options=vad_options, task=task)
 
             if debug:
                 elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to load model: {elapsed_time:.2f} ms")
+                logging.info(f"Duration to load model: {elapsed_time:.2f} ms")
 
             start_time = time.time_ns() / 1e6
 
@@ -169,7 +353,7 @@ class Predictor(BasePredictor):
 
             if debug:
                 elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to load audio: {elapsed_time:.2f} ms")
+                logging.info(f"Duration to load audio: {elapsed_time:.2f} ms")
 
             start_time = time.time_ns() / 1e6
 
@@ -178,7 +362,7 @@ class Predictor(BasePredictor):
 
             if debug:
                 elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to transcribe: {elapsed_time:.2f} ms")
+                logging.info(f"Duration to transcribe: {elapsed_time:.2f} ms")
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -188,13 +372,13 @@ class Predictor(BasePredictor):
                 if detected_language in DEFAULT_ALIGN_MODELS_TORCH or detected_language in DEFAULT_ALIGN_MODELS_HF:
                     result = align(audio, result, debug)
                 else:
-                    print(f"Cannot align output as language {detected_language} is not supported for alignment")
+                    logging.info(f"Cannot align output as language {detected_language} is not supported for alignment")
 
             if diarization:
                 result = diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
 
             if debug:
-                print(f"max gpu memory allocated over runtime: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB")
+                logging.info(f"max gpu memory allocated over runtime: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB")
 
         return Output(
             segments=result["segments"],
@@ -204,55 +388,56 @@ class Predictor(BasePredictor):
 
 def get_audio_duration(file_path):
     probe = ffmpeg.probe(file_path)
-    stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
-    return float(stream['duration']) * 1000
+
+    stream = next((stream for stream in probe["streams"] if stream["codec_type"] == "audio"), None)
+    if stream is None:
+        raise ValueError(f"No audio stream found in {file_path}")
+    if stream and "duration" in stream:
+        return float(stream["duration"]) * 1000
+
+    # Fallback to format duration if stream duration is not available
+    if "format" in probe and "duration" in probe["format"]:
+        return float(probe["format"]["duration"]) * 1000
+
+    raise ValueError("Could not determine audio duration from file metadata")
 
 
 def detect_language(full_audio_file_path, segments_starts, language_detection_min_prob,
-                    language_detection_max_tries, asr_options, vad_options, iteration=1):
-    model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, asr_options=asr_options,
+                    language_detection_max_tries, asr_options, vad_options, task):
+    model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, asr_options=asr_options, task=task,
                                 vad_options=vad_options)
+    try:
+        best = None
+        for iteration, start_ms in enumerate(segments_starts, start=1):
+            audio_segment_file_path = extract_audio_segment(full_audio_file_path, start_ms, 30000)
+            try:
+                audio = whisperx.load_audio(audio_segment_file_path)
+                model_n_mels = model.model.feat_kwargs.get("feature_size")
+                segment = log_mel_spectrogram(
+                    audio[:N_SAMPLES],
+                    n_mels=model_n_mels if model_n_mels is not None else 80,
+                    padding=0 if audio.shape[0] >= N_SAMPLES else N_SAMPLES - audio.shape[0]
+                )
+                encoder_output = model.model.encode(segment)
+                results = model.model.model.detect_language(encoder_output)
+                language_token, language_probability = results[0][0]
+                language = language_token[2:-2]
+            finally:
+                audio_segment_file_path.unlink()
 
-    start_ms = segments_starts[iteration - 1]
+            logging.info(f"Iteration {iteration} - Detected language: {language} ({language_probability:.2f})")
 
-    audio_segment_file_path = extract_audio_segment(full_audio_file_path, start_ms, 30000)
+            detected = {"language": language, "probability": language_probability, "iterations": iteration}
+            if best is None or language_probability > best["probability"]:
+                best = detected
+            if language_probability >= language_detection_min_prob:
+                break
 
-    audio = whisperx.load_audio(audio_segment_file_path)
-
-    model_n_mels = model.model.feat_kwargs.get("feature_size")
-    segment = log_mel_spectrogram(audio[: N_SAMPLES],
-                                  n_mels=model_n_mels if model_n_mels is not None else 80,
-                                  padding=0 if audio.shape[0] >= N_SAMPLES else N_SAMPLES - audio.shape[0])
-    encoder_output = model.model.encode(segment)
-    results = model.model.model.detect_language(encoder_output)
-    language_token, language_probability = results[0][0]
-    language = language_token[2:-2]
-
-    print(f"Iteration {iteration} - Detected language: {language} ({language_probability:.2f})")
-
-    audio_segment_file_path.unlink()
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model
-
-    detected_language = {
-        "language": language,
-        "probability": language_probability,
-        "iterations": iteration
-    }
-
-    if language_probability >= language_detection_min_prob or iteration >= language_detection_max_tries:
-        return detected_language
-
-    next_iteration_detected_language = detect_language(full_audio_file_path, segments_starts,
-                                                       language_detection_min_prob, language_detection_max_tries,
-                                                       asr_options, vad_options, iteration + 1)
-
-    if next_iteration_detected_language["probability"] > detected_language["probability"]:
-        return next_iteration_detected_language
-
-    return detected_language
+        return best
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+        del model
 
 
 def extract_audio_segment(input_file_path, start_time_ms, duration_ms):
@@ -262,7 +447,7 @@ def extract_audio_segment(input_file_path, start_time_ms, duration_ms):
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
         temp_file_path = Path(temp_file.name)
 
-        print(f"Extracting from {input_file_path.name} to {temp_file.name}")
+        logging.info(f"Extracting from {input_file_path.name} to {temp_file.name}")
 
         try:
             (
@@ -272,7 +457,7 @@ def extract_audio_segment(input_file_path, start_time_ms, duration_ms):
                 .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
             )
         except ffmpeg.Error as e:
-            print("ffmpeg error occurred: ", e.stderr.decode('utf-8'))
+            logging.info("ffmpeg error occurred: ", e.stderr.decode('utf-8'))
             raise e
 
     return temp_file_path
@@ -303,7 +488,7 @@ def align(audio, result, debug):
 
     if debug:
         elapsed_time = time.time_ns() / 1e6 - start_time
-        print(f"Duration to align output: {elapsed_time:.2f} ms")
+        logging.info(f"Duration to align output: {elapsed_time:.2f} ms")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -315,14 +500,17 @@ def align(audio, result, debug):
 def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
     start_time = time.time_ns() / 1e6
 
+    log_memory("before diarize model load")
     diarize_model = DiarizationPipeline(token=huggingface_access_token, device=device)
+    log_memory("diarize model loaded, before inference")
     diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+    log_memory("after diarize inference")
 
     result = whisperx.assign_word_speakers(diarize_segments, result)
 
     if debug:
         elapsed_time = time.time_ns() / 1e6 - start_time
-        print(f"Duration to diarize segments: {elapsed_time:.2f} ms")
+        logging.info(f"Duration to diarize segments: {elapsed_time:.2f} ms")
 
     gc.collect()
     torch.cuda.empty_cache()
