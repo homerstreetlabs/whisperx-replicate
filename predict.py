@@ -1,6 +1,6 @@
 from cog import BasePredictor, Input, Path, BaseModel
 from typing import Any, Optional
-from whisperx.audio import N_SAMPLES, log_mel_spectrogram
+from whisperx.audio import N_SAMPLES, SAMPLE_RATE, log_mel_spectrogram
 from whisperx.alignment import DEFAULT_ALIGN_MODELS_TORCH, DEFAULT_ALIGN_MODELS_HF
 from whisperx.diarize import DiarizationPipeline
 
@@ -29,6 +29,23 @@ os.environ.setdefault(
 compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accuracy)
 device = "cuda"
 whisper_arch = "./models/faster-whisper-large-v3"
+# Diarization model is baked into the image at build time (see build.sh) and loaded from this
+# local directory so it does NOT depend on the caller-supplied HF token. pyannote resolves the
+# gated `community-1` weights (and its bundled segmentation/embedding/plda sub-models) from local
+# disk, so callers whose tokens never accepted the community-1 user agreement still get diarization.
+diarization_model_dir = "./models/diarization/speaker-diarization-community-1"
+# English alignment model (torchaudio WAV2VEC2_ASR_BASE_960H). Baked into the image and copied
+# into torch.hub's checkpoint cache in setup() so whisperx's align step loads it locally instead
+# of downloading ~360MB at runtime. Only covers English; other languages still resolve via HF.
+align_model_filename = "wav2vec2_fairseq_base_ls960_asr_ls960.pth"
+# Adaptive diarization segmentation step. 90% window overlap (0.1) gives the best speaker-boundary
+# precision, but its clustering cost scales ~O(N²) with audio length and OOMs / overruns the worker
+# health check on very long files. Episodes over the threshold use a coarser step (fewer analysis
+# windows → far cheaper clustering, slightly coarser turn boundaries); shorter episodes keep the
+# high-quality default.
+diarization_long_episode_hours = 5.0
+diarization_long_episode_step = 0.33   # > 5h
+diarization_default_step = 0.1         # <= 5h (community-1 / pyannote default)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -58,16 +75,20 @@ def _proc_kb(path, key):
     return None
 
 
-def memory_snapshot():
+def memory_snapshot(include_gpu=True):
     g = 1024 ** 3
     parts = []
-    try:
-        if torch.cuda.is_available():
-            parts.append(f"gpu_alloc={torch.cuda.memory_allocated() / g:.2f}G")
-            parts.append(f"gpu_reserved={torch.cuda.memory_reserved() / g:.2f}G")
-            parts.append(f"gpu_peak={torch.cuda.max_memory_reserved() / g:.2f}G")
-    except Exception:
-        pass
+    # GPU stats touch the CUDA API. Only query them from the main thread (include_gpu=True);
+    # the background sampler passes include_gpu=False so it never races main-thread CUDA
+    # context init / model .to(device) — a rare but real native-crash vector.
+    if include_gpu:
+        try:
+            if torch.cuda.is_available():
+                parts.append(f"gpu_alloc={torch.cuda.memory_allocated() / g:.2f}G")
+                parts.append(f"gpu_reserved={torch.cuda.memory_reserved() / g:.2f}G")
+                parts.append(f"gpu_peak={torch.cuda.max_memory_reserved() / g:.2f}G")
+        except Exception:
+            pass
 
     rss = _proc_kb("/proc/self/status", "VmRSS:")
     if rss is not None:
@@ -92,9 +113,9 @@ def memory_snapshot():
     return "  ".join(parts) if parts else "n/a"
 
 
-def log_memory(tag):
+def log_memory(tag, include_gpu=True):
     try:
-        logging.info(f"[mem] {tag}: {memory_snapshot()}")
+        logging.info(f"[mem] {tag}: {memory_snapshot(include_gpu=include_gpu)}")
     except Exception:
         pass
 
@@ -107,7 +128,10 @@ class MemorySampler(threading.Thread):
 
     def run(self):
         while not self._stop.wait(self.interval):
-            log_memory("sample")
+            # Background thread: never touch CUDA APIs here (include_gpu=False). Host
+            # RSS/cgroup is what we need for OOM detection; GPU stats are sampled on the
+            # main thread at key checkpoints instead.
+            log_memory("sample", include_gpu=False)
 
     def stop(self):
         self._stop.set()
@@ -215,18 +239,42 @@ class Predictor(BasePredictor):
     def setup(self):
         install_termination_logging()
 
-        source_folder = './models/vad'
         destination_folder = '../root/.cache/torch'
-        file_name = 'whisperx-vad-segmentation.bin'
-
         os.makedirs(destination_folder, exist_ok=True)
 
-        source_file_path = os.path.join(source_folder, file_name)
-        if os.path.exists(source_file_path):
-            destination_file_path = os.path.join(destination_folder, file_name)
+        # VAD model -> torch cache (legacy; whisperx may already bundle this).
+        vad_source = os.path.join('./models/vad', 'whisperx-vad-segmentation.bin')
+        if os.path.exists(vad_source):
+            vad_dest = os.path.join(destination_folder, 'whisperx-vad-segmentation.bin')
+            if not os.path.exists(vad_dest):
+                shutil.copy(vad_source, destination_folder)
 
-            if not os.path.exists(destination_file_path):
-                shutil.copy(source_file_path, destination_folder)
+        # English alignment model -> torch.hub checkpoint cache, so the align step loads it
+        # locally instead of downloading ~360MB at runtime.
+        align_source = os.path.join('./models/align', align_model_filename)
+        if os.path.exists(align_source):
+            hub_ckpt_dir = os.path.join(destination_folder, 'hub', 'checkpoints')
+            os.makedirs(hub_ckpt_dir, exist_ok=True)
+            align_dest = os.path.join(hub_ckpt_dir, align_model_filename)
+            if not os.path.exists(align_dest):
+                shutil.copy(align_source, align_dest)
+
+        # Load the diarization model ONCE at boot rather than per-prediction. The per-prediction
+        # Pipeline.from_pretrained(...).to(device) was dying intermittently on the FIRST prediction
+        # of a cold-booted worker (first CUDA init + GPU load, under the prediction health-check
+        # window). Doing it here moves that fragile load into the more forgiving boot window, and
+        # applies pyannote's in-memory Lightning checkpoint upgrade once here instead of in the
+        # prediction path. Best-effort: on failure we fall back to per-prediction loading so the
+        # worker still boots (no crash-loop). Only possible when the model is baked in (no caller
+        # token needed); otherwise it stays None and loads per-prediction with the caller's token.
+        self.diarize_model = None
+        if os.path.isdir(diarization_model_dir):
+            try:
+                log_memory("before diarize preload (setup)")
+                self.diarize_model = load_diarization_model(token=None)
+                log_memory("diarize model preloaded (setup)")
+            except Exception:
+                logging.exception("[setup] diarization preload failed; will load per-prediction")
 
     def run(
             self,
@@ -271,8 +319,9 @@ class Predictor(BasePredictor):
                 description="Assign speaker ID labels",
                 default=False),
             huggingface_access_token: Optional[str] = Input(
-                description="To enable diarization, please enter your HuggingFace token (read). You need to accept "
-                            "the user agreement for the models specified in the README.",
+                description="HuggingFace token (read). Optional: the diarization model is baked into the image, so a "
+                            "token is only needed as a fallback if the model is not pre-cached. If provided, the "
+                            "account must have accepted the pyannote/speaker-diarization-community-1 user agreement.",
                 default=None),
             min_speakers: Optional[int] = Input(
                 description="Minimum number of speakers if diarization is activated (leave blank if unknown)",
@@ -294,9 +343,6 @@ class Predictor(BasePredictor):
                 description="User ID for webhook correlation",
                 default=None),
     ) -> Output:
-        if diarization and not huggingface_access_token:
-            raise ValueError("huggingface_access_token is required when diarization is enabled")
-
         if user_agent:
             os.environ["COG_USER_AGENT"] = user_agent
 
@@ -375,7 +421,7 @@ class Predictor(BasePredictor):
                     logging.info(f"Cannot align output as language {detected_language} is not supported for alignment")
 
             if diarization:
-                result = diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
+                result = diarize(self.diarize_model, audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
 
             if debug:
                 logging.info(f"max gpu memory allocated over runtime: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB")
@@ -497,12 +543,87 @@ def align(audio, result, debug):
     return result
 
 
-def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
+def load_diarization_model(token):
+    # Build the whisperx DiarizationPipeline, preferring the image-baked local model (no token /
+    # network needed) and falling back to a runtime HF download. One-shot retry clears the CUDA
+    # allocator and tries again on a *catchable* fault; a native segfault / SIGKILL during the GPU
+    # load kills the process outright — which is why setup() preloads this at boot, off the
+    # prediction path, for cold-boot-heavy deployments.
+    if os.path.isdir(diarization_model_dir):
+        model_source = diarization_model_dir
+    else:
+        model_source = "pyannote/speaker-diarization-community-1"
+        if not token:
+            raise ValueError(
+                f"Diarization model not found at {diarization_model_dir} and no "
+                "huggingface_access_token was provided to download it. Run ./build.sh (with "
+                "HF_TOKEN set) before `cog push`, or pass a token whose account accepted the "
+                "pyannote/speaker-diarization-community-1 user agreement."
+            )
+
+    last_err = None
+    for attempt in range(1, 3):
+        try:
+            return DiarizationPipeline(model_name=model_source, token=token, device=device)
+        except Exception as e:
+            last_err = e
+            logging.exception("[diarize] load attempt %d/2 failed for %s", attempt, model_source)
+            gc.collect()
+            torch.cuda.empty_cache()
+            if attempt < 2:
+                time.sleep(1.0)
+    raise last_err
+
+
+def _set_segmentation_step(diarize_model, seg_step):
+    # whisperx's DiarizationPipeline wraps a pyannote SpeakerDiarization pipeline as `.model`.
+    # segmentation_step controls the overlap of the ~10s analysis windows; the underlying Inference
+    # reads its `.step` (in seconds) live at inference time, so mutating it after load is safe — the
+    # same pattern pyannote uses for `segmentation_batch_size`. Best-effort: on any internal-API
+    # mismatch we log and leave the model's default step in place (no regression, just no speedup).
+    try:
+        pipe = diarize_model.model
+        inference = pipe._segmentation
+        inference.step = seg_step * inference.duration
+        pipe.segmentation_step = seg_step
+        logging.info(
+            "[diarize] segmentation_step=%.2f applied (window=%.1fs, step=%.2fs)",
+            seg_step, inference.duration, inference.step,
+        )
+        return True
+    except Exception as e:
+        logging.warning(
+            "[diarize] could not apply segmentation_step=%.2f (%s); using model default",
+            seg_step, e,
+        )
+        return False
+
+
+def diarize(diarize_model, audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
     start_time = time.time_ns() / 1e6
 
-    log_memory("before diarize model load")
-    diarize_model = DiarizationPipeline(token=huggingface_access_token, device=device)
-    log_memory("diarize model loaded, before inference")
+    log_memory("before diarize")
+
+    # Adaptive segmentation step: long episodes use a coarser step so diarization clustering
+    # (cost ~O(N²) in the number of analysis windows) stays within memory/time limits.
+    duration_hours = len(audio) / SAMPLE_RATE / 3600
+    seg_step = (
+        diarization_long_episode_step
+        if duration_hours > diarization_long_episode_hours
+        else diarization_default_step
+    )
+    logging.info("[diarize] audio=%.2fh -> segmentation_step=%.2f", duration_hours, seg_step)
+
+    # Normally preloaded once at boot in setup(). Load now only if that didn't happen — the model
+    # isn't baked into the image, or the boot-time preload failed on this worker.
+    if diarize_model is None:
+        diarize_model = load_diarization_model(huggingface_access_token)
+
+    # The pipeline is reused across predictions, so always (re)apply the step for THIS run; a
+    # previous long episode may have left it at the coarser value.
+    _set_segmentation_step(diarize_model, seg_step)
+
+    log_memory("diarize model ready, before inference")
     diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
     log_memory("after diarize inference")
 
@@ -512,8 +633,8 @@ def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_sp
         elapsed_time = time.time_ns() / 1e6 - start_time
         logging.info(f"Duration to diarize segments: {elapsed_time:.2f} ms")
 
+    # Free per-inference intermediates but keep the (resident) model loaded for reuse.
     gc.collect()
     torch.cuda.empty_cache()
-    del diarize_model
 
     return result
